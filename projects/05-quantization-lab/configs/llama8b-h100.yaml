@@ -1,0 +1,38 @@
+# Quantization comparison for Llama-3.1-8B on a single H100.
+#
+# Start each endpoint first (see `quantlab.py plan` for the exact commands),
+# then: ./quantlab.py run --config configs/llama8b-h100.yaml
+#
+# Note the 4-bit entries point at PRE-QUANTIZED checkpoints. You cannot pass
+# --quantization awq to an fp16 checkpoint; the weights must already be
+# quantized. fp8 is the exception, vLLM quantizes on load.
+model: meta-llama/Llama-3.1-8B-Instruct
+baseline: bf16
+out: results
+concurrency: [1, 8, 32, 64]
+quality_prompts: 64
+
+slo:
+  ttft_ms: 2000
+  p_itl_ms: 50
+
+schemes:
+  - name: bf16
+    url: http://localhost:8000
+    model: meta-llama/Llama-3.1-8B-Instruct
+
+  - name: fp8
+    url: http://localhost:8001
+    model: meta-llama/Llama-3.1-8B-Instruct
+
+  - name: int8-w8a8
+    url: http://localhost:8002
+    model: neuralmagic/Meta-Llama-3.1-8B-Instruct-quantized.w8a8
+
+  - name: awq-int4
+    url: http://localhost:8003
+    model: hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
+
+  - name: bf16-kv8
+    url: http://localhost:8004
+    model: meta-llama/Llama-3.1-8B-Instruct

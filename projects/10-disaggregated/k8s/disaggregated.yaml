@@ -1,0 +1,171 @@
+# Disaggregated prefill/decode on Kubernetes.
+#
+# Two independently scalable pools behind one router. The pools are separate
+# Deployments precisely so they can scale on different signals: prefill scales
+# with input-token rate, decode scales with concurrent generations. Putting
+# them in one Deployment forfeits the main operational benefit.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disagg-config
+data:
+  # The router needs to know both pools. In llm-d / Dynamo style stacks this
+  # is discovery rather than static config; static is shown here because it
+  # makes the topology explicit.
+  PREFILL_ENDPOINTS: "http://vllm-prefill:8000"
+  DECODE_ENDPOINTS: "http://vllm-decode:8000"
+  KV_TRANSFER_BACKEND: "nixl"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-prefill
+spec:
+  clusterIP: None          # headless: the router addresses pods individually
+  selector: {app: vllm-prefill}
+  ports: [{name: http, port: 8000}, {name: kv, port: 5557}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-decode
+spec:
+  clusterIP: None
+  selector: {app: vllm-decode}
+  ports: [{name: http, port: 8000}, {name: kv, port: 5557}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-prefill
+  labels: {app: vllm-prefill, role: prefill}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: vllm-prefill}}
+  template:
+    metadata:
+      labels: {app: vllm-prefill, role: prefill}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: vllm
+          image: ghcr.io/example/vllm-serve:latest
+          args:
+            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --port=8000
+            # Prefill workers need very little KV cache: they hold a prompt
+            # only long enough to compute its KV and ship it. Handing them 90%
+            # of VRAM for cache wastes the memory that decode actually needs.
+            - --gpu-memory-utilization=0.60
+            - --max-num-batched-tokens=16384
+            # No decode happens here, so chunking buys nothing and only adds
+            # scheduling overhead.
+            - --no-enable-chunked-prefill
+            - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_producer"}
+          ports: [{containerPort: 8000}, {containerPort: 5557}]
+          resources:
+            limits: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+            requests: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 60
+      volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+      # Prefill and decode pods should land close to each other: the KV
+      # transfer crosses this link on every request, and a rack hop can cost
+      # more than the prefill it is offloading.
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app: vllm-decode}}
+                topologyKey: topology.kubernetes.io/zone
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decode
+  labels: {app: vllm-decode, role: decode}
+spec:
+  replicas: 5
+  selector: {matchLabels: {app: vllm-decode}}
+  template:
+    metadata:
+      labels: {app: vllm-decode, role: decode}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: vllm
+          image: ghcr.io/example/vllm-serve:latest
+          args:
+            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --port=8000
+            # Decode is where KV cache lives, so give it everything available.
+            - --gpu-memory-utilization=0.92
+            - --max-num-seqs=384
+            - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer"}
+          ports: [{containerPort: 8000}, {containerPort: 5557}]
+          resources:
+            limits: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+            requests: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 60
+          # Decode pods hold long-lived streams. Draining matters more here
+          # than on prefill, where a request is resident for milliseconds.
+          lifecycle:
+            preStop: {exec: {command: ["sleep", "45"]}}
+      terminationGracePeriodSeconds: 120
+      volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+---
+# Independent autoscaling is the payoff. Prefill scales on input-token rate;
+# decode scales on running sequences. See project 11 for why queue depth rather
+# than GPU utilisation is the right signal for both.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-prefill-scaler
+spec:
+  scaleTargetRef: {name: vllm-prefill}
+  minReplicaCount: 2
+  maxReplicaCount: 12
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: sum(rate(vllm:prompt_tokens_total{role="prefill"}[2m]))
+        threshold: "30000"     # prompt tokens/sec per replica
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-decode-scaler
+spec:
+  scaleTargetRef: {name: vllm-decode}
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  cooldownPeriod: 600          # decode drains slowly; scale down cautiously
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: sum(vllm:num_requests_running{role="decode"})
+        threshold: "250"       # concurrent generations per replica

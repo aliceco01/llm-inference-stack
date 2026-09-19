@@ -1,0 +1,99 @@
+# AI gateway configuration.
+#
+# Backends are tried in tier order: primary -> secondary -> cheaper_model ->
+# cached. Within a tier, the least loaded backend that is meeting its TTFT SLO
+# wins. The chain deliberately ends in something that is not an error.
+
+max_attempts: 3
+allow_cached_response: true
+cached_response_max_age_s: 3600
+
+# Retries are capped as a FRACTION of traffic, not per request. A per-request
+# retry count multiplies offered load exactly when a backend is degrading;
+# a budget keeps retries useful for isolated failures and harmless in an outage.
+retry_budget:
+  ratio: 0.1          # at most 10% of traffic may be retries
+  window_s: 10
+  min_per_s: 1        # always allow a trickle
+
+# Hedging: send a duplicate when the first backend is slow. delay_ms should sit
+# near the primary's p95 TTFT, not its mean. At p95 this costs ~5% extra load
+# and targets exactly the requests that were going to be slow.
+hedge:
+  enabled: false
+  delay_ms: 800
+  max_hedges: 1
+  only_if_no_tokens_yet: true
+
+backends:
+  # --- primary: self-hosted -------------------------------------------------
+  - name: vllm-a
+    base_url: http://127.0.0.1:8000
+    model: llama-3.1-8b
+    tier: primary
+    ttft_slo_ms: 1500
+    max_concurrent: 256
+    self_hosted: true
+
+  - name: vllm-b
+    base_url: http://127.0.0.1:8001
+    model: llama-3.1-8b
+    tier: primary
+    ttft_slo_ms: 1500
+    max_concurrent: 256
+    self_hosted: true
+
+  # --- secondary: a hosted provider of the same model ----------------------
+  # Costs money per token, so it sits behind the self-hosted fleet and only
+  # takes traffic when the primaries are unavailable or missing their SLO.
+  - name: provider-same-model
+    base_url: https://api.example-provider.com
+    model: meta-llama/Llama-3.1-8B-Instruct
+    tier: secondary
+    api_key_env: PROVIDER_API_KEY
+    usd_per_m_prompt: 0.18
+    usd_per_m_output: 0.18
+    ttft_slo_ms: 2500
+    self_hosted: false
+
+  # --- cheaper_model: a smaller model, worse answers, still answers ---------
+  # This is the real degradation step. Serving a 1B model's answer during an
+  # outage is worse than the 8B answer and far better than a 503.
+  - name: provider-small-model
+    base_url: https://api.example-provider.com
+    model: meta-llama/Llama-3.2-1B-Instruct
+    tier: cheaper_model
+    api_key_env: PROVIDER_API_KEY
+    usd_per_m_prompt: 0.04
+    usd_per_m_output: 0.04
+    ttft_slo_ms: 4000
+    self_hosted: false
+
+tenants:
+  # Limits are enforced on BOTH requests and tokens. RPM alone is not enough:
+  # one request can be 200 tokens or 200,000, so a tenant with long prompts can
+  # saturate the fleet while staying comfortably inside an RPM quota.
+  - tenant: default
+    rpm: 300
+    tpm: 300000
+    burst_requests: 30
+    burst_tokens: 30000
+    max_concurrent: 32
+
+  - tenant: interactive-app
+    rpm: 1200
+    tpm: 1500000
+    burst_requests: 120
+    burst_tokens: 150000
+    max_concurrent: 128
+    usd_budget_per_hour: 40.0
+
+  - tenant: batch-jobs
+    # Batch traffic gets generous token throughput and low concurrency, so it
+    # cannot crowd out interactive requests at the engine's batch level.
+    rpm: 200
+    tpm: 4000000
+    burst_requests: 20
+    burst_tokens: 400000
+    max_concurrent: 8
+    usd_budget_per_hour: 15.0

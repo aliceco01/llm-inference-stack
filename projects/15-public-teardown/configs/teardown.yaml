@@ -1,0 +1,87 @@
+# Three serving configurations, measured identically.
+#
+# Start each endpoint first, then:
+#   ./teardown.py run     --config configs/teardown.yaml
+#   ./teardown.py verify  --results results/
+#   ./teardown.py publish --results results/ --out site/
+#
+# The three configs differ by ONE dimension each from the baseline, so a
+# difference in the results is attributable. A "tuned" config that changes six
+# flags at once produces a number you cannot explain and cannot act on.
+
+out: results
+concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
+waves: 10               # requests per concurrency level = waves x concurrency
+min_requests: 128       # floor, so p99 has enough samples
+warmup_requests: 16
+open_loop: true
+open_loop_s: 45
+rate_multipliers: [0.8, 1.0, 1.2]
+
+slo:
+  ttft_ms: 2000
+  p_itl_ms: 50
+  itl_percentile: 95
+
+configs:
+  # --- A: baseline ---------------------------------------------------------
+  - name: baseline
+    description: "A: bf16, no prefix caching, no chunked prefill"
+    base_url: http://127.0.0.1:8000
+    model: llama-3.1-8b
+    expect_model: llama-3.1-8b
+    engine: vllm
+    engine_version: "0.11.0"
+    workload: balanced
+    simulated: false
+    flags:
+      dtype: bfloat16
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      max_num_seqs: 256
+      gpu_memory_utilization: 0.90
+    notes: "Reference point. Every other config differs from this by one thing."
+
+  # --- B: scheduling only --------------------------------------------------
+  - name: scheduling
+    description: "B: bf16 + prefix caching + chunked prefill"
+    base_url: http://127.0.0.1:8001
+    model: llama-3.1-8b
+    expect_model: llama-3.1-8b
+    engine: vllm
+    engine_version: "0.11.0"
+    workload: balanced
+    simulated: false
+    flags:
+      dtype: bfloat16
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 256
+      gpu_memory_utilization: 0.90
+    notes: >
+      Isolates the scheduling and caching changes. No numerics change, so no
+      quality measurement is required to act on this result.
+
+  # --- C: numerics ---------------------------------------------------------
+  - name: fp8
+    description: "C: fp8 weights and KV, plus B's scheduling"
+    base_url: http://127.0.0.1:8002
+    model: llama-3.1-8b
+    expect_model: llama-3.1-8b
+    engine: vllm
+    engine_version: "0.11.0"
+    workload: balanced
+    simulated: false
+    flags:
+      quantization: fp8
+      kv_cache_dtype: fp8
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 256
+      gpu_memory_utilization: 0.90
+    notes: >
+      Changes numerics, so a latency win here is NOT actionable on its own.
+      Pair with projects/05-quantization-lab/quality.py against config B before
+      drawing any conclusion.

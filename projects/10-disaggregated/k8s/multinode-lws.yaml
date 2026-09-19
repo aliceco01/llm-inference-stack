@@ -1,0 +1,121 @@
+# Multi-node decode pool using LeaderWorkerSet.
+#
+# When a model does not fit on one node, tensor parallelism spans nodes and the
+# replica becomes a *group* of pods that must be scheduled, started, restarted
+# and scaled together. A Deployment cannot express that: it treats pods as
+# interchangeable, and a TP group is the opposite of interchangeable.
+#
+# LeaderWorkerSet models the group as the unit. The leader runs the API server
+# and rank 0; workers run the remaining ranks. Scaling adds or removes whole
+# groups, and a failed worker restarts its whole group, which is correct because
+# a TP group with a missing rank is not degraded, it is dead.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-decode-70b
+spec:
+  replicas: 2                 # two independent TP-16 replicas
+  leaderWorkerTemplate:
+    size: 2                   # pods per group: 1 leader + 1 worker, 8 GPUs each
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels: {role: decode, tp-role: leader}
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8000"
+      spec:
+        containers:
+          - name: vllm-leader
+            image: ghcr.io/example/vllm-serve:latest
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                # Ray is used to span the TP group across nodes. The leader
+                # starts the head; workers join it by the group's stable DNS.
+                ray start --head --port=6379 --disable-usage-stats
+                python -m vllm.entrypoints.openai.api_server \
+                  --model meta-llama/Llama-3.1-70B-Instruct \
+                  --tensor-parallel-size 16 \
+                  --pipeline-parallel-size 1 \
+                  --distributed-executor-backend ray \
+                  --gpu-memory-utilization 0.92 \
+                  --max-model-len 32768 \
+                  --port 8000 \
+                  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+            ports: [{containerPort: 8000}, {containerPort: 6379}]
+            env:
+              - {name: GLOO_SOCKET_IFNAME, value: eth0}
+              - {name: NCCL_SOCKET_IFNAME, value: eth0}
+              # Cross-node NCCL over RDMA. Getting this wrong does not error,
+              # it silently falls back to TCP and the replica runs several
+              # times slower with no obvious symptom.
+              - {name: NCCL_IB_DISABLE, value: "0"}
+              - {name: NCCL_NET_GDR_LEVEL, value: "5"}
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                rdma/ib: 1
+                memory: 512Gi
+              requests:
+                nvidia.com/gpu: 8
+                rdma/ib: 1
+                memory: 512Gi
+            volumeMounts:
+              - {name: dshm, mountPath: /dev/shm}
+              - {name: models, mountPath: /models}
+            readinessProbe:
+              httpGet: {path: /health, port: 8000}
+              # Loading 70B across 16 GPUs on two nodes takes minutes. A tight
+              # readiness threshold here causes a restart loop that never
+              # converges, because each restart pays the load cost again.
+              initialDelaySeconds: 180
+              periodSeconds: 15
+              failureThreshold: 80
+        volumes:
+          - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+          - {name: models, persistentVolumeClaim: {claimName: model-cache}}
+    workerTemplate:
+      metadata:
+        labels: {role: decode, tp-role: worker}
+      spec:
+        containers:
+          - name: vllm-worker
+            image: ghcr.io/example/vllm-serve:latest
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                # LWS_LEADER_ADDRESS is injected by the LeaderWorkerSet
+                # controller and is stable for the life of the group.
+                ray start --address=$(LWS_LEADER_ADDRESS):6379 --block
+            env:
+              - {name: GLOO_SOCKET_IFNAME, value: eth0}
+              - {name: NCCL_SOCKET_IFNAME, value: eth0}
+              - {name: NCCL_IB_DISABLE, value: "0"}
+              - {name: NCCL_NET_GDR_LEVEL, value: "5"}
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                rdma/ib: 1
+                memory: 512Gi
+              requests:
+                nvidia.com/gpu: 8
+                rdma/ib: 1
+                memory: 512Gi
+            volumeMounts:
+              - {name: dshm, mountPath: /dev/shm}
+              - {name: models, mountPath: /models}
+        volumes:
+          - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+          - {name: models, persistentVolumeClaim: {claimName: model-cache}}
+---
+# Groups must be scheduled all-or-nothing. Without gang scheduling, a partially
+# placed group holds 8 GPUs while waiting for its second node, and under
+# contention several half-placed groups can deadlock each other indefinitely.
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: vllm-decode-70b
+spec:
+  minMember: 2
+  scheduleTimeoutSeconds: 600

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Benchmark output. Results are reproducible from the code plus the config,
+# and the parquet record files get large quickly. Publishable reports live in
+# site/ and are committed deliberately, not swept in by a glob.
+results/
+!results/.gitkeep
+site/
+
+*.egg-info/
+build/
+dist/
+.DS_Store

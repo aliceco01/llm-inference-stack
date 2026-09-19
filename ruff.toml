@@ -1,0 +1,58 @@
+# Pinned so local runs and CI agree. Ruff's default rule set moves between
+# releases, and a lint config that drifts is one that gets disabled.
+#
+# The selection below is deliberately narrow: rules that catch bugs, not rules
+# that express a house style. Every ignore has a reason, because an ignore list
+# without reasons becomes a place where real findings get buried.
+
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "build", "dist", "*.egg-info"]
+
+[lint]
+select = [
+    "E4", "E7", "E9",   # pycodestyle: the errors that are actually errors
+    "F",                # pyflakes: undefined names, unused imports, shadowing
+    "I",                # import sorting
+    "UP",               # pyupgrade
+    "B",                # bugbear: mutable defaults, loop-variable closures
+]
+
+ignore = [
+    # Semicolon-separated statements. Used for paired one-liners such as
+    # `print(hdr); print("-" * len(hdr))` in the table renderers, where
+    # splitting them adds lines without adding clarity.
+    "E702",
+
+    # Ambiguous names (`l`). Appears only as a comprehension variable over
+    # lines and lengths, where the scope is one expression.
+    "E741",
+
+    # zip() without strict=. Several zips here are intentionally ragged, most
+    # importantly the pairwise `zip(evs, evs[1:])` in RequestRecord.itls_ms,
+    # where strict=True would be wrong. The one zip where a length mismatch
+    # would silently corrupt a result (attention cost in CostModel.prefill_ms)
+    # sets strict=True explicitly.
+    "B905",
+
+    # Unused loop variables. Present where the loop count matters and the value
+    # does not, e.g. repeating an action n times.
+    "B007",
+
+    # raise-without-from inside except. The gateway and proxy deliberately
+    # collapse transport exceptions into a single _BackendError whose message
+    # already carries the original type; chaining adds a traceback that says
+    # nothing further.
+    "B904",
+]
+
+[lint.per-file-ignores]
+# The kernels import triton/torch at module scope and are only importable on a
+# CUDA machine; the test file guards them at runtime instead.
+"projects/07-triton-kernels/*" = ["E402"]
+# Tests import inside functions on purpose, to keep GPU-only modules out of
+# collection on machines without a GPU.
+"packages/llmkit/tests/*" = ["E402"]
+
+[lint.isort]
+known-first-party = ["llmkit"]

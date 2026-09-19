@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/llmkit
+          pip install pytest pytest-asyncio numpy matplotlib pyyaml httpx
+
+      - name: Syntax check every file
+        # Catches breakage in the project CLIs, which the unit tests do not
+        # import. Cheap, and it is the check that would have caught a typo in
+        # a script nobody ran this week.
+        run: python -m compileall -q packages/llmkit/llmkit projects
+
+      - name: Core tests
+        run: pytest packages/llmkit/tests -v
+
+      - name: Kernel algorithm tests
+        # The NumPy half runs anywhere. The Triton half self-skips without CUDA,
+        # which GitHub runners do not have.
+        working-directory: projects/07-triton-kernels
+        run: pytest test_kernels.py -v
+
+      - name: Reference validation
+        working-directory: projects/07-triton-kernels
+        run: python reference.py verify
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check packages/llmkit projects
+
+  smoke:
+    # End-to-end: start the simulated server, benchmark it, assert the harness
+    # produced a sane load curve. This is the test that would catch the server
+    # and the client drifting apart, which unit tests cannot see.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/llmkit
+          pip install fastapi "uvicorn[standard]" httpx numpy matplotlib pyyaml
+      - name: Start simulated server
+        run: |
+          python projects/01-inference-server/mock_server.py \
+            --model llama-3.1-8b --gpu h100-sxm --max-model-len 4096 \
+            --port 8000 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+      - name: Benchmark it
+        run: |
+          python projects/02-benchmark-suite/bench.py sweep \
+            --base-url http://127.0.0.1:8000 --model llama-3.1-8b \
+            --workload custom --input-len 256 --output-len 16 \
+            --concurrency 1,4 --requests-per-point 32 \
+            --engine simulator --simulated --no-charts --out /tmp/ci-results
+      - name: KV calculator
+        run: |
+          python projects/03-kv-calculator/kvcalc.py plan \
+            --model llama-3.1-8b --gpu h100-sxm --max-model-len 8192
+          python projects/03-kv-calculator/kvcalc.py tp-scan \
+            --model llama-3.1-70b --gpu h100-sxm --seq-len 32768 --max-model-len 32768
+      - name: Analyses that need no server
+        run: |
+          python projects/05-quantization-lab/quantlab.py predict --model llama-3.1-8b --gpu h100-sxm
+          python projects/06-speculative-decoding/specdec.py plan --batch-size 1
+          python projects/09-paged-attention/experiment.py fragmentation --out /tmp/ci-results
+          python projects/11-autoscaler/autoscaler.py signals --duration 600 --out /tmp/ci-results

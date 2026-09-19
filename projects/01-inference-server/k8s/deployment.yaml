@@ -1,0 +1,77 @@
+# Production-shaped vLLM deployment. The parts that matter for inference and
+# are easy to get wrong are commented.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama8b
+  labels: {app: vllm-llama8b}
+spec:
+  selector: {app: vllm-llama8b}
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama8b
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: vllm-llama8b}
+  template:
+    metadata:
+      labels: {app: vllm-llama8b}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # One GPU per pod, and the pod must not be evicted casually: model load
+      # from object storage is minutes, so a restart is a real outage.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: vllm
+          image: ghcr.io/example/vllm-serve:latest
+          args: ["--model", "meta-llama/Llama-3.1-8B-Instruct"]
+          ports: [{containerPort: 8000}]
+          env:
+            - {name: HF_HOME, value: /models}
+            - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+            # NCCL needs shared memory; the default 64MB /dev/shm deadlocks
+            # multi-GPU tensor parallelism in a way that looks like a hang.
+            - {name: NCCL_SHM_DISABLE, value: "0"}
+          resources:
+            limits: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+            requests: {nvidia.com/gpu: 1, memory: 64Gi, cpu: "8"}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: dshm, mountPath: /dev/shm}
+          # Readiness must not pass until the model is loaded AND the KV cache
+          # is profiled, or the Service will send traffic into a cold pod and
+          # the first users eat a 90 second TTFT.
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 60
+          # Liveness must be far more tolerant than readiness. A busy engine
+          # under a long prefill can miss a probe; restarting it turns a
+          # latency blip into a multi-minute outage.
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 600
+            periodSeconds: 30
+            failureThreshold: 10
+          lifecycle:
+            preStop:
+              # Let in-flight generations drain before the process dies.
+              exec: {command: ["sleep", "30"]}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: model-cache}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}

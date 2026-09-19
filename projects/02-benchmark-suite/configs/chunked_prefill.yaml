@@ -1,0 +1,20 @@
+# Compare two serving configurations on one chart.
+#   ./bench.py compare --config configs/chunked_prefill.yaml
+title: "Chunked prefill on vs off"
+simulated: true
+out: results
+concurrency: [1, 2, 4, 8, 16, 32]
+requests_per_point: 96
+warmup_requests: 8
+slo:
+  ttft_ms: 1000
+  p_itl_ms: 40
+targets:
+  - name: "chunked prefill OFF"
+    base_url: "http://127.0.0.1:8000"
+    model: "llama-3.1-8b"
+    workload: "balanced"
+  - name: "chunked prefill ON"
+    base_url: "http://127.0.0.1:8001"
+    model: "llama-3.1-8b"
+    workload: "balanced"
