@@ -1,5 +1,9 @@
 # LLM Inference Stack
 
+[![ci](https://github.com/aliceco01/llm-inference-stack/actions/workflows/ci.yml/badge.svg)](https://github.com/aliceco01/llm-inference-stack/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.10%20%7C%203.12-blue.svg)](packages/llmkit/pyproject.toml)
+
 Fifteen systems for serving, optimizing and scaling LLM inference, built as
 **one stack rather than fifteen scripts**.
 
