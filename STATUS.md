@@ -19,7 +19,7 @@ GPU**.
 | 04 prefix proxy | proxy serves and routes; `experiment.py` ran, then was rewritten after it exposed cache contamination (see below) |
 | 05 quantization lab | `predict`, `plan` |
 | 06 speculative decoding | `plan`, `curve`, `simulate` |
-| 07 Triton kernels | `reference.py verify` and `traffic` (NumPy algorithm validation) |
+| 07 Triton kernels | `reference.py verify` and `traffic`; 13 NumPy algorithm tests pass, 20 CUDA tests skip cleanly |
 | 08 chunked prefill | `policy`, `timeline` |
 | 09 PagedAttention | `fragmentation`, `blocksize`, `eviction`, `preemption`, `cow` |
 | 10 disaggregated | `split`, `transfer`, `sweep`, `compare` |
@@ -85,6 +85,13 @@ Kept here because they are more informative than a clean history would be.
   healthy, never unhealthy, so an unreachable replica reported `available: true`
   until a user request found it. Probe failures now count toward the breaker,
   with a higher threshold than request failures.
+- **Module-scope `importorskip` skipped a whole test file.** The kernel tests
+  used `pytest.importorskip("torch")` at module scope, which raises during
+  collection and skips *every* test in the file, including the thirteen NumPy
+  algorithm tests that need no GPU and exist precisely so the algorithms can be
+  validated on a laptop. They had never run. CI caught it as exit code 5, "no
+  tests collected". Replaced with a lazy `skipif` so the NumPy tests always run
+  and only the CUDA tests skip.
 
 ## Next steps, in value order
 

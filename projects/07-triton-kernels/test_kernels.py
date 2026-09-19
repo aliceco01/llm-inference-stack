@@ -104,8 +104,26 @@ def test_traffic_model_predicts_fusion_gain():
 # --------------------------------------------------------------------------
 # Triton tests: require CUDA
 # --------------------------------------------------------------------------
-cuda = pytest.importorskip("torch", reason="torch not installed")
-HAS_CUDA = cuda.cuda.is_available() if hasattr(cuda, "cuda") else False
+def _has_cuda() -> bool:
+    """True only if torch is installed AND a CUDA device is present.
+
+    Deliberately NOT `pytest.importorskip` at module scope: that raises Skipped
+    during collection and skips the ENTIRE file, including every NumPy test
+    above, which need no GPU and are the whole reason the algorithms can be
+    validated on a laptop. Doing it that way silently skipped ten passing tests
+    and reported exit code 5 (no tests collected) in CI.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+HAS_CUDA = _has_cuda()
 requires_cuda = pytest.mark.skipif(not HAS_CUDA, reason="no CUDA device")
 
 
